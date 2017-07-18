@@ -1,3 +1,5 @@
+# :markup: markdown
+
 module LiquidInterpolatable
   extend ActiveSupport::Concern
 
@@ -90,7 +92,9 @@ module LiquidInterpolatable
 
   def interpolate_string(string, self_object = nil)
     interpolate_with(self_object) do
-      Liquid::Template.parse(string).render!(interpolation_context)
+      catch :as_object do
+        Liquid::Template.parse(string).render!(interpolation_context)
+      end
     end
   end
 
@@ -125,10 +129,11 @@ module LiquidInterpolatable
     # userinfo, host, port, registry, path, opaque, query, and
     # fragment.
     def to_uri(uri, base_uri = nil)
-      if base_uri
-        URI(base_uri) + uri.to_s
+      case base_uri
+      when nil, ''
+        Utils.normalize_uri(uri.to_s)
       else
-        URI(uri.to_s)
+        Utils.normalize_uri(base_uri) + Utils.normalize_uri(uri.to_s)
       end
     rescue URI::Error
       nil
@@ -147,7 +152,7 @@ module LiquidInterpolatable
       else
         url = url.to_s
         begin
-          uri = URI(url)
+          uri = Utils.normalize_uri(url)
         rescue URI::Error
           return url
         end
@@ -168,7 +173,7 @@ module LiquidInterpolatable
             case response.status
             when 301, 302, 303, 307
               if location = response['location']
-                uri += location
+                uri += Utils.normalize_uri(location)
                 next
               end
             end
@@ -183,6 +188,11 @@ module LiquidInterpolatable
       logger.error "Too many rediretions in #{__method__}(#{url.inspect}) [uri=#{uri.to_s.inspect}]"
 
       url
+    end
+
+    # Rebase URIs contained in attributes in a given HTML fragment
+    def rebase_hrefs(input, base_uri)
+      Utils.rebase_hrefs(input, base_uri) rescue input
     end
 
     # Unescape (basic) HTML entities in a string
@@ -216,6 +226,30 @@ module LiquidInterpolatable
 
     def regex_replace_first(input, regex, replacement = nil)
       input.to_s.sub(Regexp.new(regex), unescape_replacement(replacement.to_s))
+    end
+
+    # Serializes data as JSON
+    def json(input)
+      JSON.dump(input)
+    end
+
+    # Returns a Ruby object
+    #
+    # It can be used as a JSONPath replacement for Agents that only support Liquid:
+    #
+    # Event:   {"something": {"nested": {"data": 1}}}
+    # Liquid:  {{something.nested | as_object}}
+    # Returns: {"data": 1}
+    #
+    # Splitting up a string with Liquid filters and return the Array:
+    #
+    # Event:   {"data": "A,B,C"}}
+    # Liquid:  {{data | split: ',' | as_object}}
+    # Returns: ['A', 'B', 'C']
+    #
+    # as_object ALWAYS has be the last filter in a Liquid expression!
+    def as_object(object)
+      throw :as_object, object.as_json
     end
 
     private
@@ -297,9 +331,7 @@ module LiquidInterpolatable
       end
 
       def render(context)
-        credential = context.registers[:agent].credential(@credential_name)
-        raise "No user credential named '#{@credential_name}' defined" if credential.nil?
-        credential
+        context.registers[:agent].credential(@credential_name)
       end
     end
 
@@ -311,4 +343,100 @@ module LiquidInterpolatable
   end
   Liquid::Template.register_tag('credential', LiquidInterpolatable::Tags::Credential)
   Liquid::Template.register_tag('line_break', LiquidInterpolatable::Tags::LineBreak)
+
+  module Blocks
+    # Replace every occurrence of a given regex pattern in the first
+    # "in" block with the result of the "with" block in which the
+    # variable `match` is set for each iteration, which can be used as
+    # follows:
+    #
+    # - `match[0]` or just `match`: the whole matching string
+    # - `match[1]`..`match[n]`: strings matching the numbered capture groups
+    # - `match.size`: total number of the elements above (n+1)
+    # - `match.names`: array of names of named capture groups
+    # - `match[name]`..: strings matching the named capture groups
+    # - `match.pre_match`: string preceding the match
+    # - `match.post_match`: string following the match
+    # - `match.***`: equivalent to `match['***']` unless it conflicts with the existing methods above
+    #
+    # If named captures (`(?<name>...)`) are used in the pattern, they
+    # are also made accessible as variables.  Note that if numbered
+    # captures are used mixed with named captures, you could get
+    # unexpected results.
+    #
+    # Example usage:
+    #
+    #     {% regex_replace "\w+" in %}Use me like this.{% with %}{{ match | capitalize }}{% endregex_replace %}
+    #     {% assign fullname = "Doe, John A." %}
+    #     {% regex_replace_first "\A(?<name1>.+), (?<name2>.+)\z" in %}{{ fullname }}{% with %}{{ name2 }} {{ name1 }}{% endregex_replace_first %}
+    #
+    #     Use Me Like This.
+    #
+    #     John A. Doe
+    #
+    class RegexReplace < Liquid::Block
+      Syntax = /\A\s*(#{Liquid::QuotedFragment})(?:\s+in)?\s*\z/
+
+      def initialize(tag_name, markup, tokens)
+        super
+
+        case markup
+        when Syntax
+          @regexp = $1
+        else
+          raise Liquid::SyntaxError, 'Syntax Error in regex_replace tag - Valid syntax: regex_replace pattern in'
+        end
+        @in_block = Liquid::BlockBody.new
+        @with_block = nil
+      end
+
+      def parse(tokens)
+        if more = parse_body(@in_block, tokens)
+          @with_block = Liquid::BlockBody.new
+          parse_body(@with_block, tokens)
+       end
+     end
+
+      def nodelist
+        if @with_block
+          [@in_block, @with_block]
+        else
+          [@in_block]
+        end
+      end
+
+      def unknown_tag(tag, markup, tokens)
+        return super unless tag == 'with'.freeze
+        @with_block = Liquid::BlockBody.new
+      end
+
+      def render(context)
+        begin
+          regexp = Regexp.new(context[@regexp].to_s)
+        rescue ::SyntaxError => e
+          raise Liquid::SyntaxError, "Syntax Error in regex_replace tag - #{e.message}"
+        end
+
+        subject = @in_block.render(context)
+
+        subject.send(first? ? :sub : :gsub, regexp) {
+          next '' unless @with_block
+          m = Regexp.last_match
+          context.stack do
+            m.names.each do |name|
+              context[name] = m[name]
+            end
+            context['match'.freeze] = m
+            @with_block.render(context)
+          end
+        }
+      end
+
+      def first?
+        @tag_name.end_with?('_first'.freeze)
+      end
+    end
+  end
+  Liquid::Template.register_tag('regex_replace',       LiquidInterpolatable::Blocks::RegexReplace)
+  Liquid::Template.register_tag('regex_replace_first', LiquidInterpolatable::Blocks::RegexReplace)
 end

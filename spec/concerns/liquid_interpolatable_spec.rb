@@ -1,4 +1,4 @@
-require 'spec_helper'
+require 'rails_helper'
 require 'nokogiri'
 
 describe LiquidInterpolatable::Filters do
@@ -45,6 +45,16 @@ describe LiquidInterpolatable::Filters do
       agent.interpolation_context['something'] = '&#39;&lt;foo&gt; &amp; bar&#x27;'
       agent.options['cleaned'] = '{{ something | unescape }}'
       expect(agent.interpolated['cleaned']).to eq("'<foo> & bar'")
+    end
+  end
+
+  describe "json" do
+    let(:agent) { Agents::InterpolatableAgent.new(name: "test") }
+
+    it 'serializes data to json' do
+      agent.interpolation_context['something'] = {foo: 'bar'}
+      agent.options['cleaned'] = '{{ something | json }}'
+      expect(agent.interpolated['cleaned']).to eq('{"foo":"bar"}')
     end
   end
 
@@ -96,6 +106,10 @@ describe LiquidInterpolatable::Filters do
       expect(@filter.to_uri(123, 'http://example.com/dir/1')).to eq(URI('http://example.com/dir/123'))
     end
 
+    it 'should normalize a URL' do
+      expect(@filter.to_uri('a[]', 'http://example.com/dir/1')).to eq(URI('http://example.com/dir/a%5B%5D'))
+    end
+
     it 'should return a URI value in interpolation' do
       expect(@agent.interpolated['foo']).to eq('/dir/1')
     end
@@ -104,6 +118,15 @@ describe LiquidInterpolatable::Filters do
       @agent.options['foo'] = '{% assign u = s | to_uri:"http://example.com/dir/1" %}{{ u.path }}'
       @agent.interpolation_context['s'] = 'foo/index.html'
       expect(@agent.interpolated['foo']).to eq('/dir/foo/index.html')
+    end
+
+    it 'should normalize a URI value if an empty base URI is given' do
+      @agent.options['foo'] = '{{ u | to_uri: b }}'
+      @agent.interpolation_context['u'] = "\u{3042}"
+      @agent.interpolation_context['b'] = ""
+      expect(@agent.interpolated['foo']).to eq('%E3%81%82')
+      @agent.interpolation_context['b'] = nil
+      expect(@agent.interpolated['foo']).to eq('%E3%81%82')
     end
   end
 
@@ -130,8 +153,8 @@ describe LiquidInterpolatable::Filters do
       expect(@filter.uri_expand(nil)).to eq('')
       expect(@filter.uri_expand('')).to eq('')
       expect(@filter.uri_expand(5)).to eq('5')
-      expect(@filter.uri_expand([])).to eq('[]')
-      expect(@filter.uri_expand({})).to eq('{}')
+      expect(@filter.uri_expand([])).to eq('%5B%5D')
+      expect(@filter.uri_expand({})).to eq('%7B%7D')
       expect(@filter.uri_expand(URI('/'))).to eq('/')
       expect(@filter.uri_expand(URI('http:google.com'))).to eq('http:google.com')
       expect(@filter.uri_expand(URI('http:/google.com'))).to eq('http:/google.com')
@@ -218,6 +241,133 @@ describe LiquidInterpolatable::Filters do
       agent.interpolation_context['something'] = "foo\\1\n\nfoo\\bar\n\nfoo\\baz"
       agent.options['test'] = "{{ something | regex_replace: '\\\\(\\w{2,})', '\\1\\\\' | regex_replace: '\\n+', '\\n'  }}"
       expect(agent.interpolated['test']).to eq("foo\\1\nfoobar\\\nfoobaz\\")
+    end
+  end
+
+  describe 'regex_replace_first block' do
+    let(:agent) { Agents::InterpolatableAgent.new(name: "test") }
+
+    it 'should replace the first occurrence of a string using regex' do
+      agent.interpolation_context['something'] = 'foobar zoobar'
+      agent.options['cleaned'] = '{% regex_replace_first "(?<word>\S+)(?<suffix>bar)" in %}{{ something }}{% with %}{{ word | upcase }}{{ suffix }}{% endregex_replace_first %}'
+      expect(agent.interpolated['cleaned']).to eq('FOObar zoobar')
+    end
+
+    it 'should be able to take a pattern in a variable' do
+      agent.interpolation_context['something'] = 'foobar zoobar'
+      agent.interpolation_context['pattern'] = "(?<word>\\S+)(?<suffix>bar)"
+      agent.options['cleaned'] = '{% regex_replace_first pattern in %}{{ something }}{% with %}{{ word | upcase }}{{ suffix }}{% endregex_replace_first %}'
+      expect(agent.interpolated['cleaned']).to eq('FOObar zoobar')
+    end
+
+    it 'should define a variable named "match" in a "with" block' do
+      agent.interpolation_context['something'] = 'foobar zoobar'
+      agent.interpolation_context['pattern'] = "(?<word>\\S+)(?<suffix>bar)"
+      agent.options['cleaned'] = '{% regex_replace_first pattern in %}{{ something }}{% with %}{{ match.word | upcase }}{{ match["suffix"] }}{% endregex_replace_first %}'
+      expect(agent.interpolated['cleaned']).to eq('FOObar zoobar')
+    end
+  end
+
+  describe 'regex_replace block' do
+    let(:agent) { Agents::InterpolatableAgent.new(name: "test") }
+
+    it 'should replace the all occurrences of a string using regex' do
+      agent.interpolation_context['something'] = 'foobar zoobar'
+      agent.options['cleaned'] = '{% regex_replace "(?<word>\S+)(?<suffix>bar)" in %}{{ something }}{% with %}{{ word | upcase }}{{ suffix }}{% endregex_replace %}'
+      expect(agent.interpolated['cleaned']).to eq('FOObar ZOObar')
+    end
+  end
+
+  context 'as_object' do
+    let(:agent) { Agents::InterpolatableAgent.new(name: "test") }
+
+    it 'returns an array that was splitted in liquid tags' do
+      agent.interpolation_context['something'] = 'test,string,abc'
+      agent.options['array'] = "{{something | split: ',' | as_object}}"
+      expect(agent.interpolated['array']).to eq(['test', 'string', 'abc'])
+    end
+
+    it 'returns an object that was not modified in liquid' do
+      agent.interpolation_context['something'] = {'nested' => {'abc' => 'test'}}
+      agent.options['object'] = "{{something.nested | as_object}}"
+      expect(agent.interpolated['object']).to eq({"abc" => 'test'})
+    end
+
+    context 'as_json' do
+      def ensure_safety(obj)
+        JSON.parse(JSON.dump(obj))
+      end
+
+      it 'it converts "complex" objects' do
+        agent.interpolation_context['something'] = {'nested' => Service.new}
+        agent.options['object'] = "{{something | as_object}}"
+        expect(agent.interpolated['object']).to eq({'nested'=> ensure_safety(Service.new.as_json)})
+      end
+
+      it 'works with AgentDrops' do
+        agent.interpolation_context['something'] = agent
+        agent.options['object'] = "{{something | as_object}}"
+        expect(agent.interpolated['object']).to eq(ensure_safety(agent.to_liquid.as_json.stringify_keys))
+      end
+
+      it 'works with EventDrops' do
+        event = Event.new(payload: {some: 'payload'}, agent: agent, created_at: Time.now)
+        agent.interpolation_context['something'] = event
+        agent.options['object'] = "{{something | as_object}}"
+        expect(agent.interpolated['object']).to eq(ensure_safety(event.to_liquid.as_json.stringify_keys))
+      end
+
+      it 'works with MatchDataDrops' do
+        match = "test string".match(/\A(?<word>\w+)\s(.+?)\z/)
+        agent.interpolation_context['something'] = match
+        agent.options['object'] = "{{something | as_object}}"
+        expect(agent.interpolated['object']).to eq(ensure_safety(match.to_liquid.as_json.stringify_keys))
+      end
+
+      it 'works with URIDrops' do
+        uri = URI.parse("https://google.com?q=test")
+        agent.interpolation_context['something'] = uri
+        agent.options['object'] = "{{something | as_object}}"
+        expect(agent.interpolated['object']).to eq(ensure_safety(uri.to_liquid.as_json.stringify_keys))
+      end
+    end
+  end
+
+  describe 'rebase_hrefs' do
+    let(:agent) { Agents::InterpolatableAgent.new(name: "test") }
+
+    let(:fragment) { <<HTML }
+<ul>
+  <li>
+    <a href="downloads/file1"><img src="/images/iconA.png" srcset="/images/iconA.png 1x, /images/iconA@2x.png 2x">file1</a>
+  </li>
+  <li>
+    <a href="downloads/file2"><img src="/images/iconA.png" srcset="/images/iconA.png 1x, /images/iconA@2x.png 2x">file2</a>
+  </li>
+  <li>
+    <a href="downloads/file3"><img src="/images/iconB.png" srcset="/images/iconB.png 1x, /images/iconB@2x.png 2x">file3</a>
+  </li>
+</ul>
+HTML
+
+    let(:replaced_fragment) { <<HTML }
+<ul>
+  <li>
+    <a href="http://example.com/support/downloads/file1"><img src="http://example.com/images/iconA.png" srcset="http://example.com/images/iconA.png 1x, http://example.com/images/iconA@2x.png 2x">file1</a>
+  </li>
+  <li>
+    <a href="http://example.com/support/downloads/file2"><img src="http://example.com/images/iconA.png" srcset="http://example.com/images/iconA.png 1x, http://example.com/images/iconA@2x.png 2x">file2</a>
+  </li>
+  <li>
+    <a href="http://example.com/support/downloads/file3"><img src="http://example.com/images/iconB.png" srcset="http://example.com/images/iconB.png 1x, http://example.com/images/iconB@2x.png 2x">file3</a>
+  </li>
+</ul>
+HTML
+
+    it 'rebases relative URLs in a fragment' do
+      agent.interpolation_context['content'] = fragment
+      agent.options['template'] = "{{ content | rebase_hrefs: 'http://example.com/support/files.html' }}"
+      expect(agent.interpolated['template']).to eq(replaced_fragment)
     end
   end
 end

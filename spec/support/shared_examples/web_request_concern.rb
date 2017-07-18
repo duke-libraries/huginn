@@ -1,4 +1,4 @@
-require 'spec_helper'
+require 'rails_helper'
 
 shared_examples_for WebRequestConcern do
   let(:agent) do
@@ -155,6 +155,17 @@ shared_examples_for WebRequestConcern do
       expect(agent.faraday.options.params_encoder).to eq(WebRequestConcern::DoNotEncoder)
       agent.options['disable_url_encoding'] = 'true'
       expect(agent.faraday.options.params_encoder).to eq(WebRequestConcern::DoNotEncoder)
+    end
+
+    describe "redirect follow" do
+      it "should use FollowRedirects by default" do
+        expect(agent.faraday.builder.handlers).to include(FaradayMiddleware::FollowRedirects)
+      end
+
+      it "should not use FollowRedirects when disabled" do
+        agent.options['disable_redirect_follow'] = true
+        expect(agent.faraday.builder.handlers).not_to include(FaradayMiddleware::FollowRedirects)
+      end
     end
   end
 

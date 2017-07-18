@@ -5,16 +5,16 @@ module Agents
     valid_oauth_providers :wunderlist
 
     cannot_be_scheduled!
+    no_bulk_receive!
 
     gem_dependency_check { Devise.omniauth_providers.include?(:wunderlist) }
 
     description <<-MD
+      The WunderlistAgent creates new Wunderlist tasks based on the incoming event.
+
       #{'## Include the `omniauth-wunderlist` gem in your `Gemfile` and set `WUNDERLIST_OAUTH_KEY` and `WUNDERLIST_OAUTH_SECRET` in your environment to use this Agent' if dependencies_missing?}
 
-      The WunderlistAgent creates new new tasks based on the incoming event.
-
       To be able to use this Agent you need to authenticate with Wunderlist in the [Services](/services) section first.
-
     MD
 
     def default_options

@@ -1,7 +1,35 @@
-require 'spec_helper'
+require 'rails_helper'
 
 describe Agent do
   it_behaves_like WorkingHelpers
+
+  describe '.active/inactive' do
+    let(:agent) { agents(:jane_website_agent) }
+
+    it 'is active per default' do
+      expect(Agent.active).to include(agent)
+      expect(Agent.inactive).not_to include(agent)
+    end
+
+    it 'is not active when disabled' do
+      agent.update_attribute(:disabled, true)
+      expect(Agent.active).not_to include(agent)
+      expect(Agent.inactive).to include(agent)
+    end
+
+    it 'is not active when deactivated' do
+      agent.update_attribute(:deactivated, true)
+      expect(Agent.active).not_to include(agent)
+      expect(Agent.inactive).to include(agent)
+    end
+
+    it 'is not active when disabled and deactivated' do
+      agent.update_attribute(:disabled, true)
+      agent.update_attribute(:deactivated, true)
+      expect(Agent.active).not_to include(agent)
+      expect(Agent.inactive).to include(agent)
+    end
+  end
 
   describe ".bulk_check" do
     before do
@@ -15,6 +43,12 @@ describe Agent do
 
     it "should skip disabled Agents" do
       agents(:bob_weather_agent).update_attribute :disabled, true
+      mock(Agents::WeatherAgent).async_check(anything).times(@weather_agent_count - 1)
+      Agents::WeatherAgent.bulk_check("midnight")
+    end
+
+    it "should skip agents of deactivated accounts" do
+      agents(:bob_weather_agent).user.deactivate!
       mock(Agents::WeatherAgent).async_check(anything).times(@weather_agent_count - 1)
       Agents::WeatherAgent.bulk_check("midnight")
     end
@@ -35,6 +69,13 @@ describe Agent do
     end
 
     it "groups agents by type" do
+      mock(Agents::WeatherAgent).bulk_check("midnight").once
+      mock(Agents::WebsiteAgent).bulk_check("midnight").once
+      Agent.run_schedule("midnight")
+    end
+
+    it "ignores unknown types" do
+      Agent.where(id: agents(:bob_weather_agent).id).update_all type: 'UnknownTypeAgent'
       mock(Agents::WeatherAgent).bulk_check("midnight").once
       mock(Agents::WebsiteAgent).bulk_check("midnight").once
       Agent.run_schedule("midnight")
@@ -223,7 +264,7 @@ describe Agent do
         mock(Agent).find(@checker.id) { @checker }
         expect {
           Agents::SomethingSource.async_check(@checker.id)
-        }.to raise_error
+        }.to raise_error(RuntimeError)
         log = @checker.logs.first
         expect(log.message).to match(/Exception/)
         expect(log.level).to eq(4)
@@ -249,10 +290,34 @@ describe Agent do
         Agent.receive!
       end
 
-      it "should not propogate to disabled Agents" do
+      it "should not propagate to disabled Agents" do
         Agent.async_check(agents(:bob_weather_agent).id)
         agents(:bob_rain_notifier_agent).update_attribute :disabled, true
         mock(Agent).async_receive(agents(:bob_rain_notifier_agent).id, anything).times(0)
+        Agent.receive!
+      end
+
+      it "should not propagate to Agents with unknown types" do
+        Agent.async_check(agents(:jane_weather_agent).id)
+        Agent.async_check(agents(:bob_weather_agent).id)
+
+        Agent.where(id: agents(:bob_rain_notifier_agent).id).update_all type: 'UnknownTypeAgent'
+
+        mock(Agent).async_receive(agents(:bob_rain_notifier_agent).id, anything).times(0)
+        mock(Agent).async_receive(agents(:jane_rain_notifier_agent).id, anything).times(1)
+
+        Agent.receive!
+      end
+
+      it "should not propagate from Agents with unknown types" do
+        Agent.async_check(agents(:jane_weather_agent).id)
+        Agent.async_check(agents(:bob_weather_agent).id)
+
+        Agent.where(id: agents(:bob_weather_agent).id).update_all type: 'UnknownTypeAgent'
+
+        mock(Agent).async_receive(agents(:bob_rain_notifier_agent).id, anything).times(0)
+        mock(Agent).async_receive(agents(:jane_rain_notifier_agent).id, anything).times(1)
+
         Agent.receive!
       end
 
@@ -263,7 +328,7 @@ describe Agent do
         Agent.async_check(agents(:bob_weather_agent).id)
         expect {
           Agent.async_receive(agents(:bob_rain_notifier_agent).id, [agents(:bob_weather_agent).events.last.id])
-        }.to raise_error
+        }.to raise_error(RuntimeError)
         log = agents(:bob_rain_notifier_agent).logs.first
         expect(log.message).to match(/Exception/)
         expect(log.level).to eq(4)
@@ -292,6 +357,14 @@ describe Agent do
         }
         Agent.async_check(agents(:bob_weather_agent).id)
         Agent.async_check(agents(:jane_weather_agent).id)
+        Agent.receive!
+      end
+
+      it "should call receive for each event when no_bulk_receive! is used" do
+        mock.any_instance_of(Agents::TriggerAgent).receive(anything).twice
+        stub(Agents::TriggerAgent).no_bulk_receive? { true }
+        Agent.async_check(agents(:bob_weather_agent).id)
+        Agent.async_check(agents(:bob_weather_agent).id)
         Agent.receive!
       end
 
@@ -326,6 +399,13 @@ describe Agent do
         expect {
           Agent.receive! # and we receive it
         }.to change { agents(:bob_rain_notifier_agent).reload.last_checked_event_id }
+      end
+
+      it "should not run agents of deactivated accounts" do
+        agents(:bob_weather_agent).user.deactivate!
+        Agent.async_check(agents(:bob_weather_agent).id)
+        mock(Agent).async_receive(agents(:bob_rain_notifier_agent).id, anything).times(0)
+        Agent.receive!
       end
     end
 
@@ -483,7 +563,7 @@ describe Agent do
         agent.options = 5
         expect(agent.options["hi"]).to eq(2)
         expect(agent).to have(1).errors_on(:options)
-        expect(agent.errors_on(:options)).to include("cannot be set to an instance of Fixnum")
+        expect(agent.errors_on(:options)).to include("cannot be set to an instance of #{2.class}")  # Integer (ruby >=2.4) or Fixnum (ruby <2.4)
       end
 
       it "should not allow source agents owned by other people" do
@@ -495,6 +575,17 @@ describe Agent do
         expect(agent).to have(1).errors_on(:sources)
         agent.user = users(:jane)
         expect(agent).to have(0).errors_on(:sources)
+      end
+
+      it "should not allow target agents owned by other people" do
+        agent = Agents::SomethingSource.new(:name => "something")
+        agent.user = users(:bob)
+        agent.receiver_ids = [agents(:bob_weather_agent).id]
+        expect(agent).to have(0).errors_on(:receivers)
+        agent.receiver_ids = [agents(:jane_weather_agent).id]
+        expect(agent).to have(1).errors_on(:receivers)
+        agent.user = users(:jane)
+        expect(agent).to have(0).errors_on(:receivers)
       end
 
       it "should not allow controller agents owned by other people" do
@@ -687,8 +778,40 @@ describe Agent do
       end
 
       it "calls the .receive_web_request hook, updates last_web_request_at, and saves" do
-        @agent.trigger_web_request({ :some_param => "some_value" }, "post", "text/html")
+        request = ActionDispatch::Request.new({
+          'action_dispatch.request.request_parameters' => { :some_param => "some_value" },
+          'REQUEST_METHOD' => "POST",
+          'HTTP_ACCEPT' => 'text/html'
+        })
+
+        @agent.trigger_web_request(request)
         expect(@agent.reload.memory['last_request']).to eq([ { "some_param" => "some_value" }, "post", "text/html" ])
+        expect(@agent.last_web_request_at.to_i).to be_within(1).of(Time.now.to_i)
+      end
+    end
+
+    context "when .receive_web_request is defined with just request" do
+      before do
+        @agent = Agents::WebRequestReceiver.new(:name => "something")
+        @agent.user = users(:bob)
+        @agent.save!
+
+        def @agent.receive_web_request(request)
+          memory['last_request'] = [request.params, request.method_symbol.to_s, request.format, {'HTTP_X_CUSTOM_HEADER' => request.headers['HTTP_X_CUSTOM_HEADER']}]
+          ['Ok!', 200]
+        end
+      end
+
+      it "calls the .trigger_web_request with headers, and they get passed to .receive_web_request" do
+        request = ActionDispatch::Request.new({
+          'action_dispatch.request.request_parameters' => { :some_param => "some_value" },
+          'REQUEST_METHOD' => "POST",
+          'HTTP_ACCEPT' => 'text/html',
+          'HTTP_X_CUSTOM_HEADER' => "foo"
+        })
+
+        @agent.trigger_web_request(request)
+        expect(@agent.reload.memory['last_request']).to eq([ { "some_param" => "some_value" }, "post", "text/html", {'HTTP_X_CUSTOM_HEADER' => "foo"} ])
         expect(@agent.last_web_request_at.to_i).to be_within(1).of(Time.now.to_i)
       end
     end
@@ -706,8 +829,14 @@ describe Agent do
       end
 
       it "outputs a deprecation warning and calls .receive_webhook with the params" do
+        request = ActionDispatch::Request.new({
+          'action_dispatch.request.request_parameters' => { :some_param => "some_value" },
+          'REQUEST_METHOD' => "POST",
+          'HTTP_ACCEPT' => 'text/html'
+        })
+
         mock(Rails.logger).warn("DEPRECATED: The .receive_webhook method is deprecated, please switch your Agent to use .receive_web_request.")
-        @agent.trigger_web_request({ :some_param => "some_value" }, "post", "text/html")
+        @agent.trigger_web_request(request)
         expect(@agent.reload.memory['last_webhook_request']).to eq({ "some_param" => "some_value" })
         expect(@agent.last_web_request_at.to_i).to be_within(1).of(Time.now.to_i)
       end
@@ -849,7 +978,7 @@ describe AgentDrop do
         mode: 'on_change',
         extract: {
           url: { css: '[id^=strip_enlarged_] img', value: '@src' },
-          title: { css: '.STR_DateStrip', value: './/text()' },
+          title: { css: '.STR_DateStrip', value: 'string(.)' },
         },
       },
       schedule: 'every_12h',
@@ -874,6 +1003,8 @@ describe AgentDrop do
     @efa.sources << @wsa1 << @wsa2
     @efa.memory[:test] = 1
     @efa.save!
+    @wsa1.reload
+    @wsa2.reload
   end
 
   it 'should be created via Agent#to_liquid' do
@@ -882,11 +1013,11 @@ describe AgentDrop do
     expect(@efa.to_liquid.class).to be(AgentDrop)
   end
 
-  it 'should have .type and .name' do
-    t = '{{agent.type}}: {{agent.name}}'
-    expect(interpolate(t, @wsa1)).to eq('WebsiteAgent: XKCD')
-    expect(interpolate(t, @wsa2)).to eq('WebsiteAgent: Dilbert')
-    expect(interpolate(t, @efa)).to eq('EventFormattingAgent: Formatter')
+  it 'should have .id, .type and .name' do
+    t = '[{{agent.id}}]{{agent.type}}: {{agent.name}}'
+    expect(interpolate(t, @wsa1)).to eq("[#{@wsa1.id}]WebsiteAgent: XKCD")
+    expect(interpolate(t, @wsa2)).to eq("[#{@wsa2.id}]WebsiteAgent: Dilbert")
+    expect(interpolate(t, @efa)).to eq("[#{@efa.id}]EventFormattingAgent: Formatter")
   end
 
   it 'should have .options' do

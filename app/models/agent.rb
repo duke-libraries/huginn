@@ -19,21 +19,20 @@ class Agent < ActiveRecord::Base
 
   load_types_in "Agents"
 
-  SCHEDULES = %w[every_1m every_2m every_5m every_10m every_30m every_1h every_2h every_5h every_12h every_1d every_2d every_7d
-                 midnight 1am 2am 3am 4am 5am 6am 7am 8am 9am 10am 11am noon 1pm 2pm 3pm 4pm 5pm 6pm 7pm 8pm 9pm 10pm 11pm never]
+  SCHEDULES = %w[every_1m every_2m every_5m every_10m every_30m every_1h every_2h every_5h every_12h every_1d every_2d every_7d] +
+              %w[midnight 1am 2am 3am 4am 5am 6am 7am 8am 9am 10am 11am noon 1pm 2pm 3pm 4pm 5pm 6pm 7pm 8pm 9pm 10pm 11pm never]
 
   EVENT_RETENTION_SCHEDULES = [["Forever", 0], ['1 hour', 1.hour], ['6 hours', 6.hours], ["1 day", 1.day], *([2, 3, 4, 5, 7, 14, 21, 30, 45, 90, 180, 365].map {|n| ["#{n} days", n.days] })]
-
-  attr_accessible :options, :memory, :name, :type, :schedule, :controller_ids, :control_target_ids, :disabled, :source_ids, :scenario_ids, :keep_events_for, :propagate_immediately, :drop_pending_events
 
   json_serialize :options, :memory
 
   validates_presence_of :name, :user
   validates_inclusion_of :keep_events_for, :in => EVENT_RETENTION_SCHEDULES.map(&:last)
-  validate :sources_are_owned
-  validate :controllers_are_owned
-  validate :control_targets_are_owned
-  validate :scenarios_are_owned
+  validates :sources, owned_by: :user_id
+  validates :receivers, owned_by: :user_id
+  validates :controllers, owned_by: :user_id
+  validates :control_targets, owned_by: :user_id
+  validates :scenarios, owned_by: :user_id
   validate :validate_schedule
   validate :validate_options
 
@@ -45,14 +44,14 @@ class Agent < ActiveRecord::Base
   after_save :possibly_update_event_expirations
 
   belongs_to :user, :inverse_of => :agents
-  belongs_to :service, :inverse_of => :agents
+  belongs_to :service, :inverse_of => :agents, optional: true
   has_many :events, -> { order("events.id desc") }, :dependent => :delete_all, :inverse_of => :agent
   has_one  :most_recent_event, -> { order("events.id desc") }, :inverse_of => :agent, :class_name => "Event"
   has_many :logs,  -> { order("agent_logs.id desc") }, :dependent => :delete_all, :inverse_of => :agent, :class_name => "AgentLog"
-  has_many :received_events, -> { order("events.id desc") }, :through => :sources, :class_name => "Event", :source => :events
   has_many :links_as_source, :dependent => :delete_all, :foreign_key => "source_id", :class_name => "Link", :inverse_of => :source
   has_many :links_as_receiver, :dependent => :delete_all, :foreign_key => "receiver_id", :class_name => "Link", :inverse_of => :receiver
   has_many :sources, :through => :links_as_receiver, :class_name => "Agent", :inverse_of => :receivers
+  has_many :received_events, -> { order("events.id desc") }, :through => :sources, :class_name => "Event", :source => :events
   has_many :receivers, :through => :links_as_source, :class_name => "Agent", :inverse_of => :sources
   has_many :control_links_as_controller, dependent: :delete_all, foreign_key: 'controller_id', class_name: 'ControlLink', inverse_of: :controller
   has_many :control_links_as_control_target, dependent: :delete_all, foreign_key: 'control_target_id', class_name: 'ControlLink', inverse_of: :control_target
@@ -61,8 +60,8 @@ class Agent < ActiveRecord::Base
   has_many :scenario_memberships, :dependent => :destroy, :inverse_of => :agent
   has_many :scenarios, :through => :scenario_memberships, :inverse_of => :agents
 
-  scope :active,   -> { where(disabled: false) }
-  scope :inactive, -> { where(disabled: true) }
+  scope :active,   -> { where(disabled: false, deactivated: false) }
+  scope :inactive, -> { where(['disabled = ? OR deactivated = ?', true, true]) }
 
   scope :of_type, lambda { |type|
     type = case type
@@ -97,8 +96,12 @@ class Agent < ActiveRecord::Base
 
   def receive_web_request(params, method, format)
     # Implement me in your subclass of Agent.
-    ["not implemented", 404]
+    ["not implemented", 404, "text/plain", {}] # last two elements in response array are optional
   end
+
+  # alternate method signature for receive_web_request
+  # def receive_web_request(request=ActionDispatch::Request.new( ... ))
+  # end
 
   # Implement me in your subclass to decide if your Agent is working.
   def working?
@@ -149,7 +152,8 @@ class Agent < ActiveRecord::Base
     end
   end
 
-  def trigger_web_request(params, method, format)
+  def trigger_web_request(request)
+    params = request.params.except(:action, :controller, :agent_id, :user_id, :format)
     if respond_to?(:receive_webhook)
       Rails.logger.warn "DEPRECATED: The .receive_webhook method is deprecated, please switch your Agent to use .receive_web_request."
       receive_webhook(params).tap do
@@ -157,7 +161,12 @@ class Agent < ActiveRecord::Base
         save!
       end
     else
-      receive_web_request(params, method, format).tap do
+      if method(:receive_web_request).arity == 1
+        handled_request = receive_web_request(request)
+      else
+        handled_request = receive_web_request(params, request.method_symbol.to_s, request.format.to_s)
+      end
+      handled_request.tap do
         self.last_web_request_at = Time.now
         save!
       end
@@ -208,6 +217,10 @@ class Agent < ActiveRecord::Base
     self.class.can_dry_run?
   end
 
+  def no_bulk_receive?
+    self.class.no_bulk_receive?
+  end
+
   def log(message, options = {})
     AgentLog.log_for_agent(self, message, options)
   end
@@ -246,29 +259,13 @@ class Agent < ActiveRecord::Base
   end
 
   def possibly_update_event_expirations
-    update_event_expirations! if keep_events_for_changed?
+    update_event_expirations! if saved_change_to_keep_events_for?
   end
   
   #Validation Methods
   
   private
   
-  def sources_are_owned
-    errors.add(:sources, "must be owned by you") unless sources.all? {|s| s.user_id == user_id }
-  end
-  
-  def controllers_are_owned
-    errors.add(:controllers, "must be owned by you") unless controllers.all? {|s| s.user_id == user_id }
-  end
-
-  def control_targets_are_owned
-    errors.add(:control_targets, "must be owned by you") unless control_targets.all? {|s| s.user_id == user_id }
-  end
-
-  def scenarios_are_owned
-    errors.add(:scenarios, "must be owned by you") unless scenarios.all? {|s| s.user_id == user_id }
-  end
-
   def validate_schedule
     unless cannot_be_scheduled?
       errors.add(:schedule, "is not a valid schedule") unless SCHEDULES.include?(schedule.to_s)
@@ -296,10 +293,10 @@ class Agent < ActiveRecord::Base
 
   class << self
     def build_clone(original)
-      new(original.slice(:type, :options, :schedule, :controller_ids, :control_target_ids,
-                         :source_ids, :keep_events_for, :propagate_immediately)) { |clone|
+      new(original.slice(:type, :options, :service_id, :schedule, :controller_ids, :control_target_ids,
+                         :source_ids, :keep_events_for, :propagate_immediately, :scenario_ids)) { |clone|
         # Give it a unique name
-        2.upto(count) do |i|
+        2.step do |i|
           name = '%s (%d)' % [original.name, i]
           unless exists?(name: name)
             clone.name = name
@@ -350,6 +347,14 @@ class Agent < ActiveRecord::Base
       !!@can_dry_run
     end
 
+    def no_bulk_receive!
+      @no_bulk_receive = true
+    end
+
+    def no_bulk_receive?
+      !!@no_bulk_receive
+    end
+
     def gem_dependency_check
       @gem_dependencies_checked = true
       @gem_dependencies_met = yield
@@ -365,33 +370,38 @@ class Agent < ActiveRecord::Base
     def receive!(options={})
       Agent.transaction do
         scope = Agent.
-                select("agents.id AS receiver_agent_id, sources.id AS source_agent_id, events.id AS event_id").
+                select("agents.id AS receiver_agent_id, sources.type AS source_agent_type, agents.type AS receiver_agent_type, events.id AS event_id").
                 joins("JOIN links ON (links.receiver_id = agents.id)").
                 joins("JOIN agents AS sources ON (links.source_id = sources.id)").
                 joins("JOIN events ON (events.agent_id = sources.id AND events.id > links.event_id_at_creation)").
-                where("NOT agents.disabled AND (agents.last_checked_event_id IS NULL OR events.id > agents.last_checked_event_id)")
+                where("NOT agents.disabled AND NOT agents.deactivated AND (agents.last_checked_event_id IS NULL OR events.id > agents.last_checked_event_id)")
         if options[:only_receivers].present?
           scope = scope.where("agents.id in (?)", options[:only_receivers])
         end
 
-        sql = scope.to_sql()
+        sql = scope.to_sql
 
         agents_to_events = {}
-        Agent.connection.select_rows(sql).each do |receiver_agent_id, source_agent_id, event_id|
+        Agent.connection.select_rows(sql).each do |receiver_agent_id, source_agent_type, receiver_agent_type, event_id|
+          next unless const_defined?(source_agent_type) && const_defined?(receiver_agent_type)
           agents_to_events[receiver_agent_id.to_i] ||= []
           agents_to_events[receiver_agent_id.to_i] << event_id
         end
 
-        event_ids = agents_to_events.values.flatten.uniq.compact
-
         Agent.where(:id => agents_to_events.keys).each do |agent|
+          event_ids = agents_to_events[agent.id].uniq
           agent.update_attribute :last_checked_event_id, event_ids.max
-          Agent.async_receive(agent.id, agents_to_events[agent.id].uniq)
+
+          if agent.no_bulk_receive?
+            event_ids.each { |event_id| Agent.async_receive(agent.id, [event_id]) }
+          else
+            Agent.async_receive(agent.id, event_ids)
+          end
         end
 
         {
           :agent_count => agents_to_events.keys.length,
-          :event_count => event_ids.length
+          :event_count => agents_to_events.values.flatten.uniq.compact.length
         }
       end
     end
@@ -408,6 +418,7 @@ class Agent < ActiveRecord::Base
       return if schedule == 'never'
       types = where(:schedule => schedule).group(:type).pluck(:type)
       types.each do |type|
+        next unless valid_type?(type)
         type.constantize.bulk_check(schedule)
       end
     end
@@ -416,7 +427,7 @@ class Agent < ActiveRecord::Base
     # per type of agent, so you can override this to define custom bulk check behavior for your custom Agent type.
     def bulk_check(schedule)
       raise "Call #bulk_check on the appropriate subclass of Agent" if self == Agent
-      where("agents.schedule = ? and disabled = false", schedule).pluck("agents.id").each do |agent_id|
+      where("NOT disabled AND NOT deactivated AND schedule = ?", schedule).pluck("agents.id").each do |agent_id|
         async_check(agent_id)
       end
     end
@@ -434,20 +445,23 @@ class AgentDrop
     @object.short_type
   end
 
-  [
-    :name,
-    :type,
-    :options,
-    :memory,
-    :sources,
-    :receivers,
-    :schedule,
-    :controllers,
-    :control_targets,
-    :disabled,
-    :keep_events_for,
-    :propagate_immediately,
-  ].each { |attr|
+  METHODS = %i[
+    id
+    name
+    type
+    options
+    memory
+    sources
+    receivers
+    schedule
+    controllers
+    control_targets
+    disabled
+    keep_events_for
+    propagate_immediately
+  ]
+
+  METHODS.each { |attr|
     define_method(attr) {
       @object.__send__(attr)
     } unless method_defined?(attr)
