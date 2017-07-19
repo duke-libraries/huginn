@@ -3,6 +3,9 @@ source 'https://rubygems.org'
 # Ruby 2.2.2 is the minimum requirement
 ruby ['2.2.2', RUBY_VERSION].max
 
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = Encoding::UTF_8
+
 # Ensure github repositories are fetched using HTTPS
 git_source(:github) do |repo_name|
   repo_name = "#{repo_name}/#{repo_name}" unless repo_name.include?("/")
