@@ -4,8 +4,9 @@ class GemfileHelper
       dotenv_dir = Dir[File.join(File.dirname(__FILE__), '../vendor/gems/dotenv-[0-9]*')].sort.last
 
       yield dotenv_dir
-
-      return if ENV['ON_HEROKU'] == 'true'
+      
+      return
+      # return if ENV['ON_HEROKU'] == 'true'
 
       $:.unshift File.join(dotenv_dir, 'lib')
       require "dotenv"
